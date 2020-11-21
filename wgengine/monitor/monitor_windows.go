@@ -87,6 +87,7 @@ func (m *winMon) Close() error {
 	m.cancel()
 	m.pollTicker.Stop()
 	windows.SetEvent(m.closeHandle) // wakes up any reader blocked in Receive
+	windows.CloseHandle(m.closeHandle)
 	return nil
 }
 
