@@ -14,6 +14,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"tailscale.com/logtail/backoff"
@@ -259,8 +260,16 @@ func (l *logger) uploading(ctx context.Context) {
 
 	for {
 		body := l.drainPending()
+		origlen := -1 // sentinel value: uncompressed
 		if l.zstdEncoder != nil {
-			body = l.zstdEncoder.EncodeAll(body, nil)
+			zbody := l.zstdEncoder.EncodeAll(body, nil)
+			// Only compress if the bandwidth savings are sufficient.
+			// Just the extra headers associated with enabling compression
+			// are 50 bytes by themselves.
+			if len(body)-len(zbody) > 64 {
+				origlen = len(body)
+				body = zbody
+			}
 		}
 
 		for len(body) > 0 {
@@ -269,7 +278,7 @@ func (l *logger) uploading(ctx context.Context) {
 				return
 			default:
 			}
-			uploaded, err := l.upload(ctx, body)
+			uploaded, err := l.upload(ctx, body, origlen)
 			if err != nil {
 				fmt.Fprintf(l.stderr, "logtail: upload: %v\n", err)
 			}
@@ -287,7 +296,10 @@ func (l *logger) uploading(ctx context.Context) {
 	}
 }
 
-func (l *logger) upload(ctx context.Context, body []byte) (uploaded bool, err error) {
+// upload uploads body to the log server.
+// origlen indicates the pre-compression body length.
+// If origlen is -1, the body is not compressed.
+func (l *logger) upload(ctx context.Context, body []byte, origlen int) (uploaded bool, err error) {
 	req, err := http.NewRequest("POST", l.url, bytes.NewReader(body))
 	if err != nil {
 		// I know of no conditions under which this could fail.
@@ -295,10 +307,12 @@ func (l *logger) upload(ctx context.Context, body []byte) (uploaded bool, err er
 		// TODO record logs to disk
 		panic("logtail: cannot build http request: " + err.Error())
 	}
-	if l.zstdEncoder != nil {
+	if origlen != -1 {
 		req.Header.Add("Content-Encoding", "zstd")
+		req.Header.Add("Orig-Content-Length", strconv.Itoa(origlen))
 	}
 	req.Header["User-Agent"] = nil // not worth writing one; save some bytes
+	req.Header.Add("Content-Length", strconv.Itoa(len(body)))
 
 	maxUploadTime := 45 * time.Second
 	ctx, cancel := context.WithTimeout(ctx, maxUploadTime)
@@ -306,7 +320,7 @@ func (l *logger) upload(ctx context.Context, body []byte) (uploaded bool, err er
 	req = req.WithContext(ctx)
 
 	compressedNote := "not-compressed"
-	if l.zstdEncoder != nil {
+	if origlen != -1 {
 		compressedNote = "compressed"
 	}
 
